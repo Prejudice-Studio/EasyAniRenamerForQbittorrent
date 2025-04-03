@@ -1,6 +1,4 @@
 # EasyAniRenamerForQbittorrent
-Nope
-
 一个简单的快速批量重命名qBittorrent种子文件名便于Emby刮削的脚本
 
 ## 功能
