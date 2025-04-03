@@ -1,0 +1,2 @@
+# EasyAniRenamerForQbittorrent
+Nope
