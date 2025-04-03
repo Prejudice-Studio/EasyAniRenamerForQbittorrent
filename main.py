@@ -24,11 +24,25 @@ class QBitRenamer:
         self.config = configparser.ConfigParser()
         self._init_config()
         self.load_config()
+        
+        # 添加首次运行检查
+        if not self._check_first_run():
+            self.setup_credentials()
+        
         self.debug = debug if debug is not None else self.config.getboolean('SETTINGS', 'debug_mode', fallback=False)
         self._print_debug("🛠️ 初始化完成", force=True)
         self.client = None
         self.episode_regex = self.config.get('SETTINGS', 'default_episode_regex', fallback=CONFIG['DEFAULT_EPISODE_REGEX'])
         self.lang_map = self._init_lang_map()
+
+    def _check_first_run(self):
+        """检查是否是首次运行"""
+        required_keys = ['host', 'username', 'password']
+        for key in required_keys:
+            if not self.config['QBITTORRENT'].get(key):
+                print("\n🔐 首次使用需要设置qBittorrent WebUI凭据")
+                return False
+        return True
 
     def _init_console_encoding(self):
         try:
@@ -329,15 +343,25 @@ class QBitRenamer:
             return False
 
     def setup_credentials(self):
-        print("\n🔐 首次使用需要设置qBittorrent WebUI凭据")
+        """设置qBittorrent连接凭据"""
+        print("\n⚙️ 首次运行配置向导")
+        print("="*60)
+        
+        # 显示当前配置
+        print("\n📋 当前qBittorrent配置:")
+        print(f"🌐 WebUI地址: {self.config['QBITTORRENT'].get('host', '未设置')}")
+        print(f"👤 用户名: {self.config['QBITTORRENT'].get('username', '未设置')}")
+        print(f"🔑 密码: {'*' * len(self.config['QBITTORRENT'].get('password', '')) if self.config['QBITTORRENT'].get('password') else '未设置'}")
+        
+        # 获取用户输入
+        print("\n🛠️ 请输入以下信息:")
         self.config['QBITTORRENT']['host'] = input("🌐 WebUI地址 (默认localhost:8080): ") or 'localhost:8080'
         self.config['QBITTORRENT']['username'] = input("👤 用户名: ").strip()
         self.config['QBITTORRENT']['password'] = input("🔑 密码: ").strip()
-        self.config['QBITTORRENT']['default_tag'] = input(f"🏷️ 默认标签 (当前: {self.config['QBITTORRENT'].get('default_tag', '')}): ").strip()
-        debug_mode = input("🐛 启用Debug模式吗? (true/false): ").strip().lower() == 'true'
-        self.config['SETTINGS']['debug_mode'] = 'true' if debug_mode else 'false'
-        self.debug = debug_mode
+        
+        # 保存配置
         self.save_config()
+        print("\n✅ 配置已保存！")
 
     def detect_language(self, filename):
         self._print_debug(f"🔍 检测语言标识: {filename}")
@@ -794,7 +818,16 @@ class QBitRenamer:
         print(f"📝 配置文件: {CONFIG['CONFIG_FILE']}")
         print("="*60)
         
-        config_action = input("是否查看/编辑当前配置? (v查看/e编辑/回车跳过): ").lower()
+        # 显示当前配置
+        print("\n📋 当前主要配置:")
+        print(f"🌐 WebUI地址: {self.config['QBITTORRENT'].get('host', '未设置')}")
+        print(f"👤 用户名: {self.config['QBITTORRENT'].get('username', '未设置')}")
+        print(f"🔑 密码: {'*' * len(self.config['QBITTORRENT'].get('password', '')) if self.config['QBITTORRENT'].get('password') else '未设置'}")
+        print(f"🏷️ 默认标签: {self.config['QBITTORRENT'].get('default_tag', '未设置')}")
+        print(f"📂 工作目录: {self.config['SETTINGS'].get('workspace', '未设置')}")
+        print(f"🔍 最大目录深度: {self.config['SETTINGS'].get('max_dir_depth', '1')}")
+        
+        config_action = input("\n是否查看/编辑当前配置? (v查看/e编辑/回车跳过): ").lower()
         if config_action == 'v':
             self.show_config()
         elif config_action == 'e':
