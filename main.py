@@ -13,7 +13,16 @@ CONFIG = {
     'VIDEO_EXTS': ('.mkv', '.mp4', '.avi', '.mov', '.flv', '.wmv'),
     'SUBS_EXTS': ('.ass', '.srt', '.ssa', '.sub', '.idx'),
     'CONFIG_FILE': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'qb_renamer_config.ini'),
-    'DEFAULT_EPISODE_REGEX': r"\[(\d{2})(?:v\d+)?\]",
+    'DEFAULT_EPISODE_REGEXES': [
+        r"\[(\d{2})\][^\\/]*$",
+        r"\b(\d{2})\b",
+        r"E(\d{2})",
+        r"第(\d{2})话",
+        r"EP?(\d{2})",
+        r"- (\d{2}) -",
+        r"_(\d{2})_",
+        r" (\d{2}) "
+    ],
     'DEFAULT_MAX_DIR_DEPTH': '1'
 }
 
@@ -25,18 +34,43 @@ class QBitRenamer:
         self._init_config()
         self.load_config()
         
-        # 添加首次运行检查
         if not self._check_first_run():
             self.setup_credentials()
         
         self.debug = debug if debug is not None else self.config.getboolean('SETTINGS', 'debug_mode', fallback=False)
         self._print_debug("🛠️ 初始化完成", force=True)
         self.client = None
-        self.episode_regex = self.config.get('SETTINGS', 'default_episode_regex', fallback=CONFIG['DEFAULT_EPISODE_REGEX'])
+        self.episode_regexes = self._init_episode_regexes()
         self.lang_map = self._init_lang_map()
+        
+    def _init_episode_regexes(self):
+        """初始化集数正则表达式列表（带有效性验证）"""
+        default_regexes = [
+            r"S\d+E(\d+)",                  # 匹配 S01E01 格式
+            r"\[\s*(\d{2})\s*\]",            # 匹配 [01] 格式
+            r"\bEP?\s*(\d{2})\b",            # 匹配 EP01 或 E01
+            r"第\s*(\d{2})\s*[话集]",        # 匹配 第01话
+            r"\s(\d{2})(?=\D*\.mkv)",        # 匹配空格后的两位数字（在扩展名前）
+            r"_(\d{2})_",                    # 匹配 _01_
+            r"- (\d{2}) -"                   # 匹配 - 01 -
+        ]
+        if self.config.has_option('SETTINGS', 'episode_regexes'):
+            raw = self.config.get('SETTINGS', 'episode_regexes')
+            regexes = []
+            for idx, pattern in enumerate(raw.split('\n'), 1):
+                pattern = pattern.strip()
+                if not pattern:
+                    continue
+                try:
+                    re.compile(pattern)
+                    regexes.append(pattern)
+                except re.error as e:
+                    print(f"⚠️ 忽略无效正则表达式 #{idx}: {pattern} ({e})")
+            if regexes:
+                return regexes
+        return CONFIG['DEFAULT_EPISODE_REGEXES']
 
     def _check_first_run(self):
-        """检查是否是首次运行"""
         required_keys = ['host', 'username', 'password']
         for key in required_keys:
             if not self.config['QBITTORRENT'].get(key):
@@ -63,7 +97,9 @@ class QBitRenamer:
             ';password': 'WebUI登录密码',
             'password': 'adminadmin',
             ';default_tag': '默认处理的种子标签',
-            'default_tag': 'anime'
+            'default_tag': 'anime',
+            ';processed_tag': '处理完成的种子标签',
+            'processed_tag': 'processed'
         }
         self.config['SETTINGS'] = {
             ';default_mode': '操作模式: direct(直接重命名) | copy(复制) | move(移动) | pre(试运行)',
@@ -78,14 +114,25 @@ class QBitRenamer:
             'dry_run_first': 'true',
             ';debug_mode': '显示详细调试信息 (true/false)',
             'debug_mode': 'false',
-            ';default_episode_regex': '集数匹配正则表达式',
-            'default_episode_regex': CONFIG['DEFAULT_EPISODE_REGEX'],
+            ';episode_regexes': '集数匹配正则表达式列表（每行一个，按顺序尝试）',
+            'episode_regexes': '\n'.join([
+                r'\[(\d{2})\][^\\/]*$',
+                r'\b(\d{2})\b',
+                r'E(\d{2})',
+                r'第(\d{2})话',
+                r'EP?(\d{2})',
+                r'- (\d{2}) -',
+                r'_(\d{2})_',
+                r' (\d{2}) '
+            ]),
             ';scan_subdirs': '扫描子目录中的文件 (true/false)',
             'scan_subdirs': 'true',
             ';subgroup_mode': '是否启用字幕组标记功能 (true/false)',
             'subgroup_mode': 'false',
             ';max_dir_depth': '最大子目录扫描深度 (默认为1)',
-            'max_dir_depth': CONFIG['DEFAULT_MAX_DIR_DEPTH']
+            'max_dir_depth': CONFIG['DEFAULT_MAX_DIR_DEPTH'],
+            ';excluded_dirs': '要跳过的文件夹列表(逗号分隔,不区分大小写)',
+            'excluded_dirs': 'SPs,CDs,Scans'
         }
         self.config['NAMING'] = {
             ';season_format': '季集格式 (可用变量: {season}-季号, {episode}-集号)',
@@ -123,12 +170,36 @@ class QBitRenamer:
     def load_config(self):
         try:
             if os.path.exists(CONFIG['CONFIG_FILE']):
+                self.config = configparser.ConfigParser(
+                    interpolation=None,
+                    allow_no_value=True,
+                    delimiters=('=',),
+                    inline_comment_prefixes=(';',)
+                )
+            
+                # 自定义读取器处理续行符
                 with open(CONFIG['CONFIG_FILE'], 'r', encoding='utf-8') as f:
-                    lines = [line for line in f if not line.strip().startswith(';')]
-                self.config = configparser.ConfigParser()
-                self.config.read_string('\n'.join(lines))
-                if not self.config['QBITTORRENT'].get('host'):
-                    self.config['QBITTORRENT']['host'] = 'localhost:8080'
+                    content = []
+                    continuation = False
+                    for line in f:
+                        line = line.rstrip('\n')
+                        if line.endswith('\\'):
+                            content.append(line.rstrip('\\').strip())
+                            continuation = True
+                        else:
+                            if continuation:
+                                content[-1] += ' ' + line.strip()
+                            else:
+                                content.append(line)
+                            continuation = False
+                    self.config.read_string('\n'.join(content))
+            
+                # 处理多行正则表达式
+                if self.config.has_option('SETTINGS', 'episode_regexes'):
+                    raw = self.config.get('SETTINGS', 'episode_regexes')
+                    self.config['SETTINGS']['episode_regexes'] = '\n'.join(
+                        [line.strip() for line in raw.splitlines() if line.strip()]
+                    )
             else:
                 self._print_debug("🆕 创建默认配置", force=True)
                 self.save_config()
@@ -157,9 +228,15 @@ class QBitRenamer:
                         if k.startswith(';'):
                             f.write(f"; {v}\n")
                         else:
-                            f.write(f"{k} = {v}\n")
+                            # 修正正则表达式保存方式
+                            if section == 'SETTINGS' and k == 'episode_regexes':
+                                f.write(f"{k} = \n")
+                                for line in v.split('\n'):
+                                    f.write(f"    {line}\n")
+                            else:
+                                f.write(f"{k} = {v}\n")
                     f.write("\n")
-            self._print_debug(f"💾 配置已保存到: {CONFIG['CONFIG_FILE']}")
+                self._print_debug(f"💾 配置已保存到: {CONFIG['CONFIG_FILE']}")
         except Exception as e:
             print(f"❌ 配置保存失败: {e}")
 
@@ -179,16 +256,93 @@ class QBitRenamer:
                 print(f"  {key:20} = {value}")
                 if help_text:
                     print(f"    {help_text}")
+        
+        # 特别显示排除目录设置
+        if 'SETTINGS' in self.config and 'excluded_dirs' in self.config['SETTINGS']:
+            print("\n🔍 当前排除目录设置:")
+            excluded = self.config['SETTINGS']['excluded_dirs'].split(',')
+            print(" , ".join([d.strip() for d in excluded if d.strip()]))
 
     def _edit_section(self, section):
         print(f"\n编辑 [{section}] 配置")
         print("="*60)
+        
+        # 显示当前配置
         for key in [k for k in self.config[section] if not k.startswith(';')]:
             value = self.config[section][key]
             help_text = self.config[section].get(f';{key}', '')
             print(f"{key:20} = {value}")
             if help_text:
                 print(f"  {help_text}")
+        
+        # 特殊处理SETTINGS节的排除目录
+        if section == 'SETTINGS':
+            print("\n🛑 排除目录设置")
+            print("-"*40)
+            current_excluded = self.config[section].get('excluded_dirs', 'SPs,CDs,Scans')
+            excluded_list = [d.strip() for d in current_excluded.split(',') if d.strip()]
+            print("当前排除的目录: " + ", ".join(excluded_list) if excluded_list else "无")
+            
+            while True:
+                action = input("\n操作: [a]添加 [d]删除 [c]清除 [s]设置新列表 [回车继续]: ").lower().strip()
+                if not action:
+                    break
+                    
+                if action == 'a':  # 添加
+                    to_add = input("输入要添加的目录名(多个用逗号分隔): ").strip()
+                    if to_add:
+                        current = set(excluded_list)
+                        current.update([d.strip() for d in to_add.split(',') if d.strip()])
+                        excluded_list = sorted(current)
+                        print("更新后列表:", ", ".join(excluded_list))
+                        
+                elif action == 'd':  # 删除
+                    if not excluded_list:
+                        print("⚠️ 当前没有可删除的目录")
+                        continue
+                    print("当前排除目录:", ", ".join(f"[{i}] {d}" for i, d in enumerate(excluded_list)))
+                    try:
+                        to_remove = input("输入要删除的编号或名称(多个用空格分隔): ").strip()
+                        if to_remove:
+                            indices = set()
+                            names = set()
+                            for item in to_remove.split():
+                                if item.isdigit():
+                                    idx = int(item)
+                                    if 0 <= idx < len(excluded_list):
+                                        indices.add(idx)
+                                else:
+                                    names.add(item.lower())
+                            
+                            # 保留不在删除列表中的项目
+                            new_list = [
+                                d for i, d in enumerate(excluded_list)
+                                if i not in indices and d.lower() not in names
+                            ]
+                            if len(new_list) != len(excluded_list):
+                                excluded_list = new_list
+                                print("更新后列表:", ", ".join(excluded_list) if excluded_list else "空")
+                    except Exception as e:
+                        print(f"⚠️ 输入错误: {e}")
+                        
+                elif action == 'c':  # 清除
+                    if input("确认清除所有排除目录? (y/n): ").lower() == 'y':
+                        excluded_list = []
+                        print("已清除所有排除目录")
+                        
+                elif action == 's':  # 设置新列表
+                    new_list = input("输入新的排除目录列表(逗号分隔): ").strip()
+                    if new_list:
+                        excluded_list = [d.strip() for d in new_list.split(',') if d.strip()]
+                        print("更新后列表:", ", ".join(excluded_list) if excluded_list else "空")
+                        
+            # 保存修改后的排除目录列表
+            if excluded_list:
+                self.config[section]['excluded_dirs'] = ", ".join(excluded_list)
+            else:
+                self.config[section]['excluded_dirs'] = ""
+        
+        # 语言表特殊编辑界面
         if section == 'LANGUAGE':
             print("\n🛠️ 语言表编辑模式 (输入格式: 模式 原内容=新内容)")
             print("模式: replace(替换)/delete(删除)/add(添加)")
@@ -196,87 +350,131 @@ class QBitRenamer:
             print("  replace \\.chs\\.=CHS → 替换现有规则")
             print("  delete \\.chs\\.=CHS → 删除规则")
             print("  add \\.french\\.=FR → 添加新规则")
+            
             while True:
                 try:
                     edit_cmd = input("\n输入编辑命令 (留空结束): ").strip()
                     if not edit_cmd:
                         break
-                    parts = edit_cmd.split()
+                        
+                    parts = edit_cmd.split(maxsplit=1)
                     if len(parts) < 2:
                         print("⚠️ 格式错误，需要包含模式和内容")
                         continue
+                        
                     mode = parts[0].lower()
-                    content = ' '.join(parts[1:])
+                    content = parts[1]
+                    
                     if mode not in ('replace', 'delete', 'add'):
                         print("⚠️ 无效模式，请使用replace/delete/add")
                         continue
+                        
+                    if '=' not in content:
+                        print("⚠️ 需要包含等号(=)分隔键值")
+                        continue
+                        
+                    key, value = content.split('=', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    
                     if mode == 'delete':
-                        if '=' not in content:
-                            print("⚠️ 删除模式需要格式: key=value")
-                            continue
-                        key, value = content.split('=', 1)
-                        key = key.strip()
-                        value = value.strip()
                         if key not in self.config[section] or self.config[section][key] != value:
                             print("⚠️ 规则不存在或不匹配")
                             continue
+                            
                         print(f"将删除: {key} = {value}")
                         if input("确认删除? (y/n): ").lower() == 'y':
                             del self.config[section][key]
                             print("✅ 已删除")
+                            
                     elif mode == 'add':
-                        if '=' not in content:
-                            print("⚠️ 添加模式需要格式: key=value")
-                            continue
-                        key, value = content.split('=', 1)
-                        key = key.strip()
-                        value = value.strip()
                         if not (key.startswith('\\') or key.startswith('[')):
                             print("⚠️ 键应以\\.或\\[开头")
                             continue
+                            
+                        if key in self.config[section]:
+                            print("⚠️ 键已存在")
+                            continue
+                            
                         print(f"将添加: {key} = {value}")
                         if input("确认添加? (y/n): ").lower() == 'y':
                             self.config[section][key] = value
                             print("✅ 已添加")
+                            
                     elif mode == 'replace':
-                        if '=' not in content:
-                            print("⚠️ 替换模式需要格式: old_key=new_value")
-                            continue
-                        parts = [p.strip() for p in content.split('=') if p.strip()]
-                        if len(parts) != 2:
-                            print("⚠️ 替换模式需要格式: old_key=new_value")
-                            continue
-                        old_key, new_value = parts
-                        if old_key not in self.config[section]:
+                        if key not in self.config[section]:
                             print("⚠️ 原规则不存在")
                             continue
-                        if not new_value:
-                            print(f"将删除: {old_key} = {self.config[section][old_key]}")
-                            if input("确认删除? (y/n): ").lower() == 'y':
-                                del self.config[section][old_key]
-                                print("✅ 已删除")
-                        else:
-                            print(f"将替换: {old_key} = {self.config[section][old_key]} → {new_value}")
-                            if input("确认替换? (y/n): ").lower() == 'y':
-                                self.config[section][old_key] = new_value
-                                print("✅ 已替换")
-                    if input("\n继续修改? (y/n): ").lower() != 'y':
-                        break
+                            
+                        print(f"将替换: {key} = {self.config[section][key]} → {value}")
+                        if input("确认替换? (y/n): ").lower() == 'y':
+                            self.config[section][key] = value
+                            print("✅ 已替换")
+                            
                 except Exception as e:
                     print(f"❌ 处理出错: {e}")
+                    if self.debug:
+                        import traceback
+                        traceback.print_exc()
                     continue
-        else:
-            while True:
-                key = input("\n输入要修改的键名 (留空结束编辑): ").strip()
-                if not key:
-                    break
-                if key not in self.config[section] or key.startswith(';'):
-                    print("⚠️ 无效键名")
-                    continue
-                new_value = input(f"输入 {key} 的新值 (当前: {self.config[section][key]}): ").strip()
-                if new_value:
-                    self.config[section][key] = new_value
-                    print(f"✅ 已更新 {key} = {new_value}")
+        
+        # 常规配置项编辑
+        while True:
+            key = input("\n输入要修改的键名 (留空结束编辑): ").strip()
+            if not key:
+                break
+                
+            if key not in self.config[section] or key.startswith(';'):
+                print("⚠️ 无效键名")
+                continue
+                
+            # 跳过已特殊处理的键
+            if (section == 'SETTINGS' and key == 'excluded_dirs') or \
+            (section == 'LANGUAGE' and not key.startswith(';')):
+                continue
+                
+            current_value = self.config[section][key]
+            
+            # 处理多行值（如正则表达式列表）
+            if key == 'episode_regexes' and section == 'SETTINGS':
+                print(f"\n当前 {key} 值 (多行):")
+                print("-"*40)
+                print(current_value)
+                print("-"*40)
+                print("输入新的正则表达式列表（每行一个，空行结束）:")
+                lines = []
+                while True:
+                    line = input(f"正则 {len(lines)+1}: ").strip()
+                    if not line:
+                        break
+                    try:
+                        re.compile(line)  # 验证正则表达式
+                        lines.append(line)
+                    except re.error as e:
+                        print(f"⚠️ 无效正则表达式: {e}")
+                        
+                if lines:
+                    new_value = '\n'.join(lines)
+                    print(f"\n新值预览:")
+                    print("-"*40)
+                    print(new_value)
+                    print("-"*40)
+                    if input("确认更新? (y/n): ").lower() == 'y':
+                        self.config[section][key] = new_value
+                        print("✅ 已更新")
+                continue
+                
+            # 处理布尔值
+            if current_value.lower() in ('true', 'false'):
+                new_value = input(f"切换 {key} 值 (当前: {current_value}) [y/n]: ").lower()
+                new_value = 'true' if new_value == 'y' else 'false'
+            else:
+                new_value = input(f"输入 {key} 的新值 (当前: {current_value}): ").strip()
+                
+            if new_value:
+                self.config[section][key] = new_value
+                print(f"✅ 已更新 {key} = {new_value}")
+        
         save = input("\n是否保存更改? (y/n): ").lower() == 'y'
         if save:
             self.save_config()
@@ -315,11 +513,13 @@ class QBitRenamer:
         return True
 
     def _init_lang_map(self):
+        """初始化语言映射表（修复大小写不敏感）"""
         lang_map = {}
         if 'LANGUAGE' in self.config:
             for key, value in self.config['LANGUAGE'].items():
                 if not key.startswith(';'):
-                    pattern = key.replace('\\.', '.')
+                    # 将配置中的模式转换为忽略大小写的正则表达式
+                    pattern = key.replace('\\.', '.').replace('\\[', '[').replace('\\]', ']')
                     lang_map[pattern] = value
         return lang_map
 
@@ -364,13 +564,53 @@ class QBitRenamer:
         print("\n✅ 配置已保存！")
 
     def detect_language(self, filename):
-        self._print_debug(f"🔍 检测语言标识: {filename}")
-        filename = filename.lower()
-        for pattern, lang in self.lang_map.items():
-            if re.search(pattern, filename):
-                self._print_debug(f"✅ 检测到语言: {lang} (模式: {pattern})")
-                return lang
-        self._print_debug("⚠️ 未检测到语言标识")
+        """最终修正的语言检测方法"""
+        try:
+            filename = str(filename).lower()  # 统一转为小写
+            self._print_debug(f"🔍 检测语言 - 文件名: {filename}")
+
+            # 按优先级从高到低检查的语言规则
+            LANGUAGE_RULES = [
+                (r'\.chs&jap\.', 'CHS&JP'),
+                (r'\.cht&jap\.', 'CHT&JP'),
+                (r'\.jpsc\.', 'JP&CHS'),
+                (r'\.jptc\.', 'JP&CHT'),
+                (r'\.sc\.', 'CHS'),      # 必须放在.chs.前面
+                (r'\.chs\.', 'CHS'),     # 必须放在.cht.前面
+                (r'\[简\]', 'CHS'),
+                (r'\.tc\.', 'CHT'),      # 必须放在.cht.前面
+                (r'\.cht\.', 'CHT'),     # 必须放在.chs.后面
+                (r'\[繁\]', 'CHT'),
+                (r'\.jap\.', 'JP'),
+                (r'\.jp\.', 'JP'),
+                (r'\.jpn\.', 'JP'),
+                (r'\[日\]', 'JP'),
+                (r'\.eng\.', 'EN'),
+                (r'\.en\.', 'EN'),
+                (r'\[英\]', 'EN')
+            ]
+
+            for pattern, lang in LANGUAGE_RULES:
+                # 使用re.IGNORECASE确保大小写不敏感
+                if re.search(pattern, filename, re.IGNORECASE):
+                    self._print_debug(f"✅ 匹配成功: {pattern} → {lang}")
+                    return lang
+
+            self._print_debug("⚠️ 未匹配到任何语言规则")
+            return None
+        except Exception as e:
+            self._print_debug(f"❌ 语言检测出错: {e}")
+            return None
+        
+    def detect_episode(self, filename):
+        """使用配置的正则列表检测集号"""
+        for idx, pattern in enumerate(self.episode_regexes, 1):
+            try:
+                if match := re.search(pattern, filename, re.IGNORECASE):
+                    self._print_debug(f"✅ 正则 #{idx} 匹配成功: {pattern} → {match.group(1)}")
+                    return match.group(1)
+            except re.error as e:
+                self._print_debug(f"⚠️ 无效正则 #{idx}: {pattern} ({e})")
         return None
 
     def _sanitize_filename(self, filename):
@@ -378,48 +618,50 @@ class QBitRenamer:
         return re.sub(illegal_chars, '', filename)
 
     def generate_new_name(self, file_path, prefix, season, custom_str, is_video, subgroup_tag=""):
-        self._print_debug(f"📝 开始处理: {file_path.name}")
-        episode_match = re.search(self.episode_regex, file_path.name)
-        if not episode_match:
-            self._print_debug(f"❌ 集号匹配失败，使用正则: {self.episode_regex}")
+        try:
+            file_path = Path(file_path)
+            filename = file_path.name
+            self._print_debug(f"\n📝 开始处理文件: {filename}")
+
+            if not (episode := self.detect_episode(filename)):
+                self._print_debug("❌ 无法提取集号")
+                return None
+            
+            # 添加字幕组标记
+            if subgroup_tag:
+                prefix = f"[{subgroup_tag}] {prefix}"  # 添加方括号包裹
+
+            lang_str = ""
+            if not is_video:
+                if lang := self.detect_language(filename):
+                    lang_str = f".{lang}"
+                    self._print_debug(f"🔠 语言标签: {lang_str}")
+
+            season_str = str(season).zfill(2)
+            episode_str = str(episode).zfill(2)
+            
+            clean_custom = f".{self._sanitize_filename(custom_str)}" if custom_str else ""
+            
+            new_name = (
+                f"{prefix} "
+                f"S{season_str}E{episode_str}"
+                f"{clean_custom}"
+                f"{lang_str}"
+                f"{file_path.suffix}"
+            )
+
+            new_name = (
+                new_name.replace("..", ".")
+                .replace(" .", ".")
+                .replace(". ", ".")
+                .strip()
+            )
+
+            self._print_debug(f"✅ 最终文件名: {new_name}")
+            return new_name
+        except Exception as e:
+            self._print_debug(f"❌ 生成文件名出错: {e}")
             return None
-
-        episode = episode_match.group(1)
-        version = episode_match.group(2) if len(episode_match.groups()) > 1 else ''
-        season_str = str(season).zfill(2)
-        episode_str = str(episode).zfill(2) + version
-
-        lang_str = ''
-        if not is_video:
-            detected_lang = self.detect_language(file_path.name)
-            if detected_lang:
-                lang_str = f".{detected_lang.strip('.')}"
-                self._print_debug(f"🔍 检测到语言标签: {lang_str}")
-
-        if subgroup_tag:
-            prefix = f"[{subgroup_tag}] {prefix.strip()}"
-            self._print_debug(f"🏷️ 添加字幕组标记: {subgroup_tag}")
-
-        custom_part = ''
-        if custom_str:
-            cleaned_custom = self._sanitize_filename(custom_str.strip())
-            custom_part = f".{cleaned_custom}" if cleaned_custom else ''
-
-        title_part = f"{prefix.strip()} S{season_str}E{episode_str}"
-        detail_part = f"{custom_part}{lang_str}"
-        new_name = f"{title_part}{detail_part}{file_path.suffix}"
-
-        new_name = re.sub(r'\.{2,}', '.', new_name)
-        new_name = re.sub(r'(?<!S\d{2}E\d{2})\.', '.', new_name, count=1)
-        new_name = re.sub(r'\s+', ' ', new_name)
-        new_name = new_name.replace(' .', '.').replace('. ', '.')
-
-        if not re.match(r'^.* S\d{2}E\d{2}\..+', new_name):
-            self._print_debug("⚠️ 格式校验失败，正在尝试修复...")
-            new_name = re.sub(r'(S\d{2}E\d{2})', r'\1.', new_name, count=1)
-
-        self._print_debug(f"✅ 最终文件名: {new_name}")
-        return new_name
 
     def select_mode(self):
         modes = [
@@ -455,69 +697,117 @@ class QBitRenamer:
         return choice
 
     def _display_file_tree(self, files, max_depth=1):
-        """显示文件目录树结构"""
+        """显示文件目录树结构（最终修正版）
+        
+        参数:
+            files: 文件列表，每个元素是包含'name'和'progress'的字典
+            max_depth: 最大显示深度
+        """
         file_tree = {}
-        for file in files:
-            path = Path(file['name'])
-            parts = path.parts
+        
+        # 收集所有唯一路径
+        path_items = set()
+        for f in files:
+            if f.get('progress', 0) >= 1:  # 只处理完成的文件
+                path = Path(f['name'])
+                parts = path.parts[:max_depth + 1]  # 限制深度
+                path_items.add(tuple(parts))  # 使用元组保证可哈希
+        
+        # 构建树形结构
+        for parts in sorted(path_items):
             current_level = file_tree
-            
-            for i, part in enumerate(parts[:max_depth]):
-                if part not in current_level:
-                    current_level[part] = {}
-                current_level = current_level[part]
+            for i, part in enumerate(parts):
+                if i == len(parts) - 1 and i >= max_depth:
+                    # 文件层级
+                    if 'files' not in current_level:
+                        current_level['files'] = []
+                    current_level['files'].append(part)
+                else:
+                    # 目录层级
+                    if part not in current_level:
+                        current_level[part] = {}
+                    current_level = current_level[part]
         
         def _print_tree(node, prefix='', is_last=True):
-            connector = '└── ' if is_last else '├── '
-            print(prefix + connector + node_name)
-            new_prefix = prefix + ('    ' if is_last else '│   ')
-            items = list(node.items())
-            for i, (child_name, child_node) in enumerate(items):
-                _print_tree(child_node, new_prefix, i == len(items)-1)
+            """递归打印树结构"""
+            # 打印目录
+            dirs = [(k, v) for k, v in node.items() if k != 'files']
+            for i, (name, child) in enumerate(dirs):
+                last = i == len(dirs) - 1 and 'files' not in node
+                print(f"{prefix}{'└── ' if last else '├── '}{name}")
+                _print_tree(child, f"{prefix}{'    ' if last else '│   '}", last)
+            
+            # 打印文件
+            if 'files' in node:
+                files = node['files']
+                for i, name in enumerate(files):
+                    print(f"{prefix}{'└── ' if i == len(files)-1 else '├── '}{name}")
         
-        print("\n📂 文件目录结构预览 (最大深度: {}):".format(max_depth))
-        print(".")
-        for i, (node_name, node) in enumerate(file_tree.items()):
-            _print_tree(node, '', i == len(file_tree)-1)
+        print(f"\n📂 文件目录结构预览 (最大深度: {max_depth}):")
+        print(".")  # 根目录
+        _print_tree(file_tree)
 
-    def _process_directory(self, base_path, current_path, files, mode, workspace, prefix, season, custom_str, subgroup_tag, dir_depth=1):
-        """处理单个目录中的文件"""
+    def _process_directory(self, base_path, current_path, files, mode, workspace, 
+                        prefix, season, custom_str, subgroup_tag, dir_depth=1):
+        """处理单个目录中的文件（跳过排除目录）"""
         operations = []
         file_tree = {}
         
-        for file in files:
-            file_path = Path(file['name'])
-            relative_path = file_path.relative_to(base_path)
+        current_path = Path(current_path)
+        base_path = Path(base_path)
+        
+        # 获取排除目录列表
+        excluded_dirs = {d.strip().lower() for d in 
+                        self.config['SETTINGS'].get('excluded_dirs', 'SPs,CDs,Scans').split(',') 
+                        if d.strip()}
+        
+        # 检查当前目录是否在排除列表中
+        if current_path.name.lower() in excluded_dirs:
+            self._print_debug(f"⏭️ 跳过排除目录: {current_path}")
+            return operations, file_tree
             
-            if len(relative_path.parts) > dir_depth + 1:
+        for file in files:
+            # 跳过未完成文件
+            if file.get('progress', 0) < 1:
                 continue
                 
+            file_path = Path(file['name'])
+            
+            # 精确匹配当前目录
+            try:
+                if file_path.parent != current_path:
+                    continue
+            except ValueError:
+                continue
+                
+            # 检查文件类型
             ext = file_path.suffix.lower()
             is_video = ext in CONFIG['VIDEO_EXTS']
             is_sub = ext in CONFIG['SUBS_EXTS']
-            
-            if not (is_video or is_sub) or file['progress'] < 1:
+            if not (is_video or is_sub):
                 continue
                 
+            # 生成新文件名
             new_name = self.generate_new_name(
-                file_path, prefix, season, custom_str, is_video,
-                subgroup_tag=subgroup_tag
+                file_path, prefix, season, custom_str, is_video, subgroup_tag
             )
             if not new_name:
                 continue
                 
+            # 确定操作类型
             if mode == 'copy':
-                dest = workspace / new_name
+                dest = Path(workspace) / new_name
                 operations.append(('copy', str(file_path), str(dest)))
             elif mode == 'move':
-                dest = workspace / new_name
+                dest = Path(workspace) / new_name
                 operations.append(('move', str(file_path), str(dest)))
             elif mode == 'direct':
-                dest = str(file_path.parent / new_name) if len(file_path.parts) > 1 else new_name
+                dest = str(file_path.parent / new_name)
                 operations.append(('rename', str(file_path), dest))
-            else:
+            else:  # preview
                 operations.append(('preview', str(file_path), str(file_path.parent / new_name)))
             
+            # 记录文件信息
             file_tree[file_path.name] = {
                 'type': 'video' if is_video else 'sub',
                 'new_name': new_name,
@@ -531,34 +821,35 @@ class QBitRenamer:
         self._print_debug("🚀 开始处理种子")
         if not self._confirm_continue("开始处理种子?"):
             return
+
+        # 硬编码忽略的关键词列表（不区分大小写）
+        IGNORED_KEYWORDS = {'oad', 'ova', 'sp', 'special', 'ncop', 'nced', 'pv'}
         
+        # 获取标签设置
         default_tag = self.config['QBITTORRENT'].get('default_tag', '')
         tag = input(f"\n🏷️ 要处理的标签 (默认 '{default_tag}', 留空退出): ").strip() or default_tag
         if not tag:
             self._print_debug("⏹️ 用户退出")
             return
-            
-        custom_regex = input(f"🔍 输入自定义集数匹配正则 (留空使用默认 '{CONFIG['DEFAULT_EPISODE_REGEX']}'): ").strip()
-        self.episode_regex = custom_regex if custom_regex else CONFIG['DEFAULT_EPISODE_REGEX']
-        self._print_debug(f"📌 使用正则模式: {self.episode_regex}")
         
+        # 初始化正则表达式
+        self.episode_regexes = self._init_episode_regexes()
+        self._print_debug(f"📌 使用正则模式列表: {self.episode_regexes}")
+
+        # 字幕组标记设置
         subgroup_enabled = self.config.getboolean('SETTINGS', 'subgroup_mode', fallback=False)
-        if input("\n是否启用字幕组标记? (y/n, 默认{}): ".format("是" if subgroup_enabled else "否")).lower() in ('y', 'yes'):
-            subgroup_enabled = True
-            self.config['SETTINGS']['subgroup_mode'] = 'true'
-        else:
-            subgroup_enabled = False
-            self.config['SETTINGS']['subgroup_mode'] = 'false'
-        self.save_config()
-        
-        # 获取和设置最大目录深度
+        subgroup_choice = input("\n是否启用字幕组标记? (y/n, 默认{}): ".format("是" if subgroup_enabled else "否")).lower()
+        subgroup_enabled = subgroup_choice in ('y', 'yes') if subgroup_choice else subgroup_enabled
+        self.config['SETTINGS']['subgroup_mode'] = 'true' if subgroup_enabled else 'false'
+
+        # 目录深度设置
         try:
             max_depth = int(self.config['SETTINGS'].get('max_dir_depth', CONFIG['DEFAULT_MAX_DIR_DEPTH']))
         except (ValueError, KeyError):
             max_depth = int(CONFIG['DEFAULT_MAX_DIR_DEPTH'])
-        
-        change_depth = input(f"\n📂 当前最大目录扫描深度为 {max_depth}，是否修改？(y/n): ").lower()
-        if change_depth == 'y':
+            self.config['SETTINGS']['max_dir_depth'] = str(max_depth)
+
+        if input(f"\n📂 当前最大目录扫描深度为 {max_depth}，是否修改？(y/n): ").lower() == 'y':
             while True:
                 try:
                     new_depth = int(input("请输入新的最大扫描深度 (1-5，推荐1-2): "))
@@ -568,14 +859,14 @@ class QBitRenamer:
                         self.save_config()
                         print(f"✅ 已更新最大目录扫描深度为 {new_depth}")
                         break
-                    else:
-                        print("⚠️ 请输入1-5之间的数字")
+                    print("⚠️ 请输入1-5之间的数字")
                 except ValueError:
                     print("⚠️ 请输入有效的数字")
 
+        # 操作模式选择
         mode = self.select_mode()
-        
         workspace = None
+
         if mode in ('copy', 'move'):
             while True:
                 workspace = input(f"📁 输入工作目录 (必须指定): ").strip()
@@ -586,176 +877,340 @@ class QBitRenamer:
                         break
                     except Exception as e:
                         print(f"❌ 无法创建工作目录: {e}")
+                        if input("是否重试? (y/n): ").lower() != 'y':
+                            return
                 else:
                     print("⚠️ 工作目录不能为空")
-            self._print_debug(f"📂 工作目录: {workspace}")
-        
+
+        # 获取排除目录设置
+        excluded_dirs = {d.strip().lower() for d in 
+                        self.config['SETTINGS'].get('excluded_dirs', 'SPs,CDs,Scans').split(',') 
+                        if d.strip()}
+        self._print_debug(f"🚫 排除目录列表: {excluded_dirs}")
+        self._print_debug(f"🚫 忽略文件关键词: {IGNORED_KEYWORDS}")
+
+        # 连接qBittorrent获取种子
         self._print_debug(f"🔍 扫描标签: {tag}")
-        torrents = self.client.torrents_info(tag=tag)
-        
+        try:
+            torrents = self.client.torrents_info(tag=tag)
+        except Exception as e:
+            print(f"❌ 获取种子列表失败: {e}")
+            if hasattr(e, 'response'):
+                print(f"HTTP 错误详情: {e.response.text}")
+            return
+
+        # 跳过已处理种子
         if self.config['SETTINGS'].getboolean('skip_processed'):
-            torrents = [t for t in torrents if 'processed' not in t['tags'].split(',')]
-        
+            processed_tag = self.config['QBITTORRENT'].get('processed_tag', 'processed')
+            torrents = [t for t in torrents if processed_tag not in t.tags.split(',')]
+
         if not torrents:
             print("⚠️ 没有找到可处理的种子")
             return
-        
+
         all_operations = []
         for torrent in torrents:
-            print(f"\n🎬 发现种子: {torrent['name']}")
-            print(f"📂 保存路径: {torrent['save_path']}")
-            
+            print(f"\n🎬 发现种子: {torrent.name}")
+            print(f"📂 保存路径: {torrent.save_path}")
+        
             try:
-                files = self.client.torrents_files(torrent['hash'])
+                files = self.client.torrents_files(torrent.hash)
                 print(f"📦 文件数量: {len(files)}")
-                
-                # 显示文件目录结构
                 self._display_file_tree(files, max_depth)
             except Exception as e:
                 print(f"⚠️ 无法获取文件列表: {e}")
+                if input("是否继续处理下一个种子? (y/n): ").lower() != 'y':
+                    break
+                continue
+        
+            if input("\n是否处理此种子? (y/n, 默认y): ").lower() not in ('', 'y', 'yes'):
                 continue
             
-            if input("\n是否处理此种子? (y/n, 默认y): ").lower() not in ('', 'y', 'yes'):
-                self._print_debug(f"⏭️ 用户跳过种子: {torrent['name']}")
-                continue
-                
+            # 收集所有需要处理的深层目录（depth > 0）
+            base_path = Path(files[0].name).parent if files else Path('.')
+            deep_dirs = {}
+            
+            # 扫描所有深层目录（depth > 0且不超过max_depth），排除特定文件夹
+            for f in files:
+                try:
+                    f_path = Path(f.name)
+                    current_depth = len(f_path.parts) - len(base_path.parts)
+                    if 1 <= current_depth <= max_depth:  # 只处理深度>0的目录
+                        dir_path = f_path.parent
+                        dir_name = dir_path.name.lower()
+                        
+                        # 检查是否在排除列表中
+                        if dir_name in excluded_dirs:
+                            self._print_debug(f"⏭️ 跳过排除目录: {dir_path}")
+                            continue
+                            
+                        if dir_path not in deep_dirs:
+                            deep_dirs[dir_path] = {
+                                'files': [],
+                                'needs_custom': False
+                            }
+                        deep_dirs[dir_path]['files'].append(f)
+                except Exception as e:
+                    self._print_debug(f"⚠️ 处理文件路径出错: {f.name} → {e}")
+                    continue
+
+            # 如果没有深层目录，检查是否有根目录文件需要处理
+            root_files = []
+            if not deep_dirs:
+                for f in files:
+                    try:
+                        f_path = Path(f.name)
+                        if len(f_path.parts) - len(base_path.parts) == 0:  # 根目录文件
+                            root_files.append(f)
+                    except Exception as e:
+                        self._print_debug(f"⚠️ 处理文件路径出错: {f.name} → {e}")
+                        continue
+
+            # 第一阶段：参数设置（仅当有深层目录时才跳过根目录设置）
             current_subgroup = ""
             if subgroup_enabled:
-                current_subgroup = input(f"为此种子输入字幕组标记 (留空则不添加): ").strip().upper()
-            
-            suggested_prefix = torrent.get('category', '').strip() or re.sub(r'[\[\]_]', ' ', torrent['name']).strip()
-            suggested_prefix = re.sub(r'\s+', ' ', suggested_prefix)[:30]
-            
-            prefix = input(f"📌 输入前缀 (建议: {suggested_prefix}, 留空使用建议): ").strip()
-            if not prefix:
-                prefix = suggested_prefix
-                print(f"使用建议前缀: {prefix}")
-            
-            season = input(f"  输入季号 (默认01): ").strip().zfill(2) or '01'
-            custom_str = input("✍️ 自定义标识 (如WEB-DL, 可选): ").strip()
-            
-            self._print_debug(f"🔤 前缀: {prefix}, 季号: {season}, 字幕组: {current_subgroup}, 自定义: {custom_str}")
-            
-            files = self.client.torrents_files(torrent['hash'])
-            base_path = Path(files[0]['name']).parent if len(files) > 0 else Path('.')
-            
-            dirs_to_process = {base_path: {'prefix': prefix, 'season': season, 'custom': custom_str, 'subgroup': current_subgroup}}
-            processed_dirs = set()
-            
-            while dirs_to_process:
-                current_dir, params = dirs_to_process.popitem()
-                processed_dirs.add(current_dir)
-                
-                dir_files = [f for f in files if Path(f['name']).parent == current_dir]
-                if not dir_files:
-                    continue
+                while True:
+                    current_subgroup = input(f"为此种子输入字幕组标记 (留空则不添加): ").strip()
+                    if not current_subgroup or (len(current_subgroup) <= 20 and not any(c in r'\/:*?"<>|' for c in current_subgroup)):
+                        break
+                    print("⚠️ 字幕组标记不能包含特殊字符且长度不超过20")
+
+            suggested_prefix = torrent.category or re.sub(r'[\[\]_]', ' ', torrent.name).strip()[:30]
+            while True:
+                prefix = input(f"📌 输入前缀 (建议: {suggested_prefix}, 留空使用建议): ").strip() or suggested_prefix
+                if len(prefix) <= 50:
+                    break
+                print("⚠️ 前缀长度不能超过50字符")
+
+            while True:
+                default_season = input(f"  输入默认季号 (默认01): ").strip().zfill(2) or '01'
+                if default_season.isdigit() and 1 <= int(default_season) <= 99:
+                    break
+                print("⚠️ 请输入01-99之间的数字")
+
+            custom_str = input("✍️ 自定义标识 (如WEB-DL, 可选): ").strip()[:20]
+
+            # 第二阶段：处理深层目录（完全独立设置，不继承任何参数）
+            processed_operations = []
+            if deep_dirs:
+                print("\n🔍 发现深层目录，将单独设置每个目录参数")
+                for dir_path in sorted(deep_dirs.keys(), key=lambda x: str(x)):
+                    print(f"\n📁 正在设置目录: {dir_path}")
                     
-                operations, file_tree = self._process_directory(
-                    base_path, current_dir, dir_files, mode, workspace,
-                    params['prefix'], params['season'], params['custom'], 
-                    params['subgroup'], dir_depth=max_depth
-                )
+                    # 每个深层目录都单独设置参数
+                    dir_subgroup = current_subgroup
+                    if subgroup_enabled:
+                        while True:
+                            dir_subgroup = input(f"为此目录输入字幕组标记 (留空则不添加): ").strip()
+                            if not dir_subgroup or (len(dir_subgroup) <= 20 and not any(c in r'\/:*?"<>|' for c in dir_subgroup)):
+                                break
+                            print("⚠️ 字幕组标记不能包含特殊字符且长度不超过20")
+
+                    while True:
+                        dir_prefix = input(f"输入此前缀 (建议: {suggested_prefix}): ").strip() or suggested_prefix
+                        if len(dir_prefix) <= 50:
+                            break
+                        print("⚠️ 前缀长度不能超过50字符")
+
+                    while True:
+                        dir_season = input(f"输入此季号 (默认01): ").strip().zfill(2) or '01'
+                        if dir_season.isdigit() and 1 <= int(dir_season) <= 99:
+                            break
+                        print("⚠️ 请输入01-99之间的数字")
+
+                    dir_custom = input("✍️ 自定义标识 (如WEB-DL, 可选): ").strip()[:20]
+
+                    # 处理目录文件
+                    operations = []
+                    file_tree = {}
+                    
+                    for file in deep_dirs[dir_path]['files']:
+                        file_path = Path(file['name'])
+                        filename_lower = file_path.name.lower()
+                        
+                        # 检查是否包含忽略关键词
+                        if any(keyword in filename_lower for keyword in IGNORED_KEYWORDS):
+                            self._print_debug(f"⏭️ 跳过含忽略关键词的文件: {file_path.name}")
+                            continue
+                            
+                        # 检查文件类型
+                        ext = file_path.suffix.lower()
+                        is_video = ext in CONFIG['VIDEO_EXTS']
+                        is_sub = ext in CONFIG['SUBS_EXTS']
+                        if not (is_video or is_sub):
+                            continue
+                            
+                        # 生成新文件名
+                        new_name = self.generate_new_name(
+                            file_path, dir_prefix, dir_season, 
+                            dir_custom, is_video, dir_subgroup
+                        )
+                        if not new_name:
+                            continue
+                            
+                        # 确定操作类型
+                        if mode == 'copy':
+                            dest = Path(workspace) / new_name
+                            operations.append(('copy', str(file_path), str(dest)))
+                        elif mode == 'move':
+                            dest = Path(workspace) / new_name
+                            operations.append(('move', str(file_path), str(dest)))
+                        elif mode == 'direct':
+                            dest = str(file_path.parent / new_name)
+                            operations.append(('rename', str(file_path), dest))
+                        else:  # preview
+                            operations.append(('preview', str(file_path), str(file_path.parent / new_name)))
+                        
+                        # 记录文件信息
+                        file_tree[file_path.name] = {
+                            'type': 'video' if is_video else 'sub',
+                            'new_name': new_name,
+                            'original_path': str(file_path),
+                            'subgroup': dir_subgroup
+                        }
+                    
+                    if operations:
+                        print(f"\n🔍 目录 {dir_path} 重命名预览:")
+                        for filename, info in sorted(file_tree.items()):
+                            print(f"{'🎬' if info['type'] == 'video' else '📝'} {filename} → {info['new_name']}")
+                        
+                        if input("\n确认处理此目录? (y/n): ").lower() == 'y':
+                            processed_operations.extend(operations)
+            
+            # 第三阶段：处理根目录文件（仅当没有深层目录时）
+            elif root_files:
+                print("\n🔍 未发现深层目录，处理根目录文件")
+                operations = []
+                file_tree = {}
+                
+                for file in root_files:
+                    file_path = Path(file['name'])
+                    filename_lower = file_path.name.lower()
+                    
+                    # 检查是否包含忽略关键词
+                    if any(keyword in filename_lower for keyword in IGNORED_KEYWORDS):
+                        self._print_debug(f"⏭️ 跳过含忽略关键词的文件: {file_path.name}")
+                        continue
+                        
+                    # 检查文件类型
+                    ext = file_path.suffix.lower()
+                    is_video = ext in CONFIG['VIDEO_EXTS']
+                    is_sub = ext in CONFIG['SUBS_EXTS']
+                    if not (is_video or is_sub):
+                        continue
+                        
+                    # 生成新文件名
+                    new_name = self.generate_new_name(
+                        file_path, prefix, default_season, 
+                        custom_str, is_video, current_subgroup
+                    )
+                    if not new_name:
+                        continue
+                        
+                    # 确定操作类型
+                    if mode == 'copy':
+                        dest = Path(workspace) / new_name
+                        operations.append(('copy', str(file_path), str(dest)))
+                    elif mode == 'move':
+                        dest = Path(workspace) / new_name
+                        operations.append(('move', str(file_path), str(dest)))
+                    elif mode == 'direct':
+                        dest = str(file_path.parent / new_name)
+                        operations.append(('rename', str(file_path), dest))
+                    else:  # preview
+                        operations.append(('preview', str(file_path), str(file_path.parent / new_name)))
+                    
+                    # 记录文件信息
+                    file_tree[file_path.name] = {
+                        'type': 'video' if is_video else 'sub',
+                        'new_name': new_name,
+                        'original_path': str(file_path),
+                        'subgroup': current_subgroup
+                    }
                 
                 if operations:
-                    print(f"\n🔍 目录 {current_dir} 重命名预览:")
-                    print("="*60)
-                    for filename, info in file_tree.items():
-                        file_type = "🎬" if info['type'] == 'video' else "📝"
-                        print(f"{file_type} {filename}")
-                        print(f"→ {info['new_name']}")
-                        print("-"*60)
+                    print(f"\n🔍 根目录重命名预览:")
+                    for filename, info in sorted(file_tree.items()):
+                        print(f"{'🎬' if info['type'] == 'video' else '📝'} {filename} → {info['new_name']}")
                     
-                    if input("\n确认处理此目录? (y/n): ").lower() == 'y':
-                        all_operations.append({
-                            'name': torrent['name'],
-                            'hash': torrent['hash'],
-                            'prefix': params['prefix'],
-                            'season': params['season'],
-                            'subgroup': params['subgroup'],
-                            'custom': params['custom'],
-                            'operations': operations,
-                            'file_tree': file_tree,
-                            'path': str(current_dir)
-                        })
-                        self._print_debug(f"✅ 为目录 {current_dir} 生成 {len(operations)} 个操作")
-                    else:
-                        self._print_debug(f"⏭️ 用户取消处理目录: {current_dir}")
-                
-                if len(processed_dirs) < max_depth:
-                    subdirs = {Path(f['name']).parent for f in files 
-                              if len(Path(f['name']).parts) > len(current_dir.parts) + 1 
-                              and Path(f['name']).parent not in processed_dirs}
-                    
-                    for subdir in subdirs:
-                        if input(f"\n发现子目录 {subdir}, 要单独处理吗? (y/n): ").lower() == 'y':
-                            sub_prefix = input(f"输入此目录的前缀 (默认继承 {params['prefix']}): ").strip() or params['prefix']
-                            sub_season = input(f"输入此目录的季号 (默认 {params['season']}): ").strip() or params['season']
-                            sub_custom = input(f"输入此目录的自定义标识 (默认 {params['custom']}): ").strip() or params['custom']
-                            sub_subgroup = input(f"输入此目录的字幕组标记 (默认 {params['subgroup']}): ").strip() or params['subgroup']
-                            dirs_to_process[subdir] = {
-                                'prefix': sub_prefix,
-                                'season': sub_season,
-                                'custom': sub_custom,
-                                'subgroup': sub_subgroup
-                            }
-        
+                    if input("\n确认处理根目录文件? (y/n): ").lower() == 'y':
+                        processed_operations.extend(operations)
+
+            if processed_operations:
+                all_operations.append({
+                    'hash': torrent.hash,
+                    'name': torrent.name,
+                    'operations': processed_operations,
+                    'params': {
+                        'prefix': prefix,
+                        'season': default_season,
+                        'custom': custom_str,
+                        'subgroup': current_subgroup
+                    }
+                })
+
         if not all_operations:
-            print("⚠️ 没有生成任何操作，可能原因：")
-            print("- 没有找到符合条件的文件（视频/字幕）")
-            print("- 文件进度未完成")
-            print("- 集数正则不匹配文件名")
-            print("- 文件在子目录中但配置了不扫描子目录")
+            print("⚠️ 没有生成任何操作")
             return
-            
-        self.show_full_preview(all_operations, mode, subgroup_enabled)
         
-        if mode != 'pre':
-            confirm = input("\n⚠️ 确认执行以上操作? (y/n): ").lower()
-            if confirm != 'y':
-                print("⏹️ 操作已取消")
-                return
-                
+        self.show_full_preview(all_operations, mode, subgroup_enabled)
+
+        if mode != 'pre' and input("\n⚠️ 确认执行以上操作? (y/n): ").lower() == 'y':
             total_success = 0
-            total_files = sum(len(t['operations']) for t in all_operations)
-            
             for torrent in all_operations:
-                print(f"\n🔄 正在处理: {torrent['name']} ({torrent['path']})")
+                print(f"\n🔄 处理: {torrent['name']}")
                 success = 0
                 
                 for op_type, src, dst in torrent['operations']:
                     try:
-                        self._print_debug(f"⚡ 执行: {op_type} {src} → {dst}")
-                        
-                        if not self._confirm_continue(f"确认 {op_type} {src} → {dst}?"):
-                            continue
-                            
                         if op_type == 'copy':
-                            Path(dst).parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy2(src, dst)
                         elif op_type == 'move':
-                            Path(dst).parent.mkdir(parents=True, exist_ok=True)
                             shutil.move(src, dst)
-                        else:
+                        elif op_type == 'rename':
                             self.client.torrents_rename_file(
                                 torrent_hash=torrent['hash'],
                                 old_path=src,
-                                new_path=dst
+                                new_path=Path(src).parent / Path(dst).name
                             )
-                        
                         success += 1
+                        self._print_debug(f"✅ 成功: {src} → {dst}")
                     except Exception as e:
-                        print(f"❌ 失败: {src} → {e}")
+                        print(f"❌ 操作失败 {src} → {e}")
+                        if self.debug:
+                            import traceback
+                            traceback.print_exc()
                 
-                print(f"✅ 完成: {success}/{len(torrent['operations'])}")
-                total_success += success
-                
-                if self.config['SETTINGS'].getboolean('auto_tag_processed'):
-                    self.client.torrents_add_tags(torrent['hash'], 'processed')
-            
-            print(f"\n🎉 全部完成! 成功: {total_success}/{total_files}")
-        
-        print("\n" + "="*60)
+                if success > 0 and self.config['SETTINGS'].getboolean('auto_tag_processed'):
+                    old_tag = self.config['QBITTORRENT'].get('default_tag', '').strip()
+                    new_tag = self.config['QBITTORRENT'].get('processed_tag', 'processed').strip()
+                    
+                    try:
+                        current_tags = self.client.torrents_info(torrent_hashes=torrent['hash'])[0].tags.split(', ')
+                        
+                        if old_tag and old_tag in current_tags:
+                            self.client.torrents_remove_tags(torrent_hashes=torrent['hash'], tags=[old_tag])
+                        
+                        if new_tag not in current_tags:
+                            self.client.torrents_add_tags(torrent_hashes=torrent['hash'], tags=[new_tag])
+                            
+                        print(f"🏷️ 标签更新: 移除 {old_tag} → 添加 {new_tag}")
+                        
+                        updated = self.client.torrents_info(torrent_hashes=torrent['hash'])[0]
+                        print(f"🔍 当前标签: {updated.tags}")
+                        
+                    except Exception as e:
+                        print(f"⚠️ 标签更新失败: {str(e)}")
+                        if hasattr(e, 'response'):
+                            print(f"HTTP 错误详情: {e.response.text}")
 
+                total_success += success
+                print(f"✅ 完成: {success}/{len(torrent['operations'])}")
+
+            print(f"\n🎉 全部完成! 成功处理 {total_success} 个文件")
+        else:
+            print("⏹️ 操作已取消")
+        
     def show_full_preview(self, all_operations, mode, subgroup_enabled=False):
         mode_names = {
             'direct': '⚡ 直接模式',
@@ -766,7 +1221,7 @@ class QBitRenamer:
         
         print(f"\n🔎 完整操作预览 ({mode_names.get(mode, mode)})")
         print("="*80)
-        print(f"🔍 使用的集数匹配正则: {self.episode_regex}")
+        print(f"🔍 使用的集数匹配正则: {self.episode_regexes}")
         if subgroup_enabled:
             print(f"🔖 字幕组标记功能已启用")
         print("="*80)
@@ -782,12 +1237,13 @@ class QBitRenamer:
         for torrent in all_operations:
             print(f"\n📌 种子: {torrent['name']}")
             print(f"├─ 📂 路径: {torrent.get('path', '根目录')}")
-            print(f"├─ 🔤 前缀: {torrent['prefix']}")
-            print(f"├─ 🏷️ 季号: S{torrent['season']}")
-            if subgroup_enabled and torrent['subgroup']:
-                print(f"├─ 🔖 字幕组: {torrent['subgroup']}")
-            if torrent.get('custom'):
-                print(f"├─ ✍️ 自定义标识: {torrent['custom']}")
+            # 修正参数访问路径
+            print(f"├─ 🔤 前缀: {torrent['params']['prefix']}")  # 正确访问方式
+            print(f"├─ 🏷️ 季号: S{torrent['params']['season']}")
+            if subgroup_enabled and torrent['params'].get('subgroup'):
+                print(f"├─ 🔖 字幕组: {torrent['params']['subgroup']}")
+            if torrent['params'].get('custom'):
+                print(f"├─ ✍️ 自定义标识: {torrent['params']['custom']}")
             
             stats = {'videos': 0, 'subs': 0}
             for op in torrent['operations']:
@@ -814,7 +1270,7 @@ class QBitRenamer:
         print("="*80)
 
     def run(self):
-        print("\n🎬 qBittorrent文件整理工具 v12.7")
+        print("\n🎬 qBittorrent文件整理工具 v12.8")
         print(f"📝 配置文件: {CONFIG['CONFIG_FILE']}")
         print("="*60)
         
@@ -823,9 +1279,6 @@ class QBitRenamer:
         print(f"🌐 WebUI地址: {self.config['QBITTORRENT'].get('host', '未设置')}")
         print(f"👤 用户名: {self.config['QBITTORRENT'].get('username', '未设置')}")
         print(f"🔑 密码: {'*' * len(self.config['QBITTORRENT'].get('password', '')) if self.config['QBITTORRENT'].get('password') else '未设置'}")
-        print(f"🏷️ 默认标签: {self.config['QBITTORRENT'].get('default_tag', '未设置')}")
-        print(f"📂 工作目录: {self.config['SETTINGS'].get('workspace', '未设置')}")
-        print(f"🔍 最大目录深度: {self.config['SETTINGS'].get('max_dir_depth', '1')}")
         
         config_action = input("\n是否查看/编辑当前配置? (v查看/e编辑/回车跳过): ").lower()
         if config_action == 'v':
